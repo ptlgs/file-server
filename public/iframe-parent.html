@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Iframe Parent</title>
+</head>
+<body>
+<h1>Iframe Parent</h1>
+<button id="open-uploader">Open Uploader</button>
+<div id="uploaded-files"></div>
+
+<script>
+    document.getElementById('open-uploader').addEventListener('click', () => {
+        uploadFilesInIframe().then(files => {
+            console.log('Uploaded files:', files);
+            displayUploadedFiles(files);
+        });
+    });
+
+    function uploadFilesInIframe() {
+        return new Promise((resolve, reject) => {
+            if (document.getElementsByTagName('iframe').length) {
+                throw "iframe already open";
+            }
+            const iframe = document.createElement('iframe');
+            iframe.src = '/index.html';
+            iframe.style.width = '100%';
+            iframe.style.height = '600px';
+            document.body.appendChild(iframe);
+
+            let sessionId = null;
+
+            function receiveMessage(event) {
+                if (!window['fileUploadIframeSeenSessionIDs']) {
+                    window['fileUploadIframeSeenSessionIDs'] = {};
+                }
+                const data = event.data;
+                if (data.type === 'REQUEST_TOKEN') {
+                    if (!sessionId) {
+                        if (window['fileUploadIframeSeenSessionIDs'][data.sessionId]) {
+                            return;
+                        } else {
+                            window['fileUploadIframeSeenSessionIDs'][data.sessionId] = true;
+                            sessionId = data.sessionId;
+                        }
+                    }
+                    if (data.sessionId !== sessionId) {
+                        return;
+                    }
+                    iframe.contentWindow.postMessage({
+                        type: 'TOKEN_RESPONSE',
+                        // TODO: use `JWT_SECRET=123 node generateJwt.js | pbcopy` to update this token.
+                        token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3MjY2MDA3MzksInVzZXJJZCI6MSwiZXhwIjoxNzI2NjA0MzM5fQ.AXWe8cX3bsXeFShw3NRuWTH7dE1S1j7Tl2rOpOh8xPw',
+                        sessionId: sessionId,
+                        wantsCallback: true
+                    }, '*');
+                } else if (data.type === 'UPLOAD_COMPLETE') {
+                    if (data.sessionId !== sessionId) {
+                        return;
+                    }
+                    resolve(data.files);
+                    window.removeEventListener('message', receiveMessage);
+                    document.body.removeChild(iframe);
+                }
+            }
+
+            window.addEventListener('message', receiveMessage);
+        });
+    }
+
+    function displayUploadedFiles(files) {
+        const container = document.getElementById('uploaded-files');
+        container.innerHTML = '<h2>Uploaded Files:</h2>';
+        files.forEach(url => {
+            const link = document.createElement('a');
+            link.href = url;
+            link.textContent = url;
+            link.target = '_blank';
+            container.appendChild(link);
+            container.appendChild(document.createElement('br'));
+        });
+    }
+</script>
+</body>
+</html>
