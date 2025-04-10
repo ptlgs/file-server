@@ -317,7 +317,7 @@
         const readyMessage = "粘贴已就绪 (Command+V / Ctrl+V)";
         const focusMessage = "粘贴未就绪，请先点击页面任意位置";
 
-        const MAX_FILE_SIZE = 100 * 1024 * 1024;
+        const MAX_FILE_SIZE = 500 * 1024 * 1024;
         let uploadCompleted = false;
 
         updatePasteIndicator();
@@ -356,9 +356,9 @@
         // Update dropZone message based on 'imageOnly' and 'singleUpload'
         const dropZoneMessage = dropZone.querySelector('p');
         if (imageOnly) {
-            dropZoneMessage.textContent = '拖拽图片至此或选择图片或粘贴来上传（单个文件最多100MB）';
+            dropZoneMessage.textContent = '拖拽图片至此或选择图片或粘贴来上传（单个文件最多500MB）';
         } else {
-            dropZoneMessage.textContent = '拖拽文件至此或选择文件或粘贴来上传（单个文件最多100MB）';
+            dropZoneMessage.textContent = '拖拽文件至此或选择文件或粘贴来上传（单个文件最多500MB）';
         }
 
         // Prevent default drag behaviors
@@ -526,7 +526,7 @@
         async function uploadFile(file) {
             // Check file size before uploading
             if (file.size > MAX_FILE_SIZE) {
-                showError(`文件 "${file.name}" 超过了100MB限制。请选择较小的文件。`);
+                showError(`文件 "${file.name}" 超过了500MB限制。请选择较小的文件。`);
                 return;
             }
 

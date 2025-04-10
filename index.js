@@ -60,7 +60,7 @@ app.use(express.urlencoded({extended: true}));
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
-        fileSize: 100 * 1024 * 1024 // 100MB in bytes
+        fileSize: 500 * 1024 * 1024 // 500MB in bytes
     }
 });
 
@@ -132,8 +132,8 @@ app.post('/e', async (req, res) => {
         }
         const encryptedBuffer = Buffer.concat(chunks);
 
-        if (encryptedBuffer.length > 100 * 1024 * 1024) {
-            return res.status(400).json({error: 'File size exceeds the 100MB limit'});
+        if (encryptedBuffer.length > 500 * 1024 * 1024) {
+            return res.status(400).json({error: 'File size exceeds the 500MB limit'});
         }
 
         // Extract IV and encrypted data
@@ -172,7 +172,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         res.json({url: newUrl});
     } catch (error) {
         if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
-            return res.status(400).json({error: 'File size exceeds the 100MB limit'});
+            return res.status(400).json({error: 'File size exceeds the 500MB limit'});
         }
         console.error('Error uploading file:', error);
         res.status(500).json({error: 'Error uploading file'});
@@ -201,7 +201,7 @@ app.get('/:sha256/:filename', async (req, res) => {
         let fileData = decrypt(encryptedData);
         hitCounter.set(key, (hitCounter.get(key) || 0) + 1);
 
-        if (hitCounter.get(key) >= 8 && fileData.length <= 100 * 1024 * 1024) {
+        if (hitCounter.get(key) >= 8 && fileData.length <= 500 * 1024 * 1024) {
             await fileCache.set(key, fileData);
         }
 
