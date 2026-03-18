@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>文件上传</title>
+    <title>内部工具</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/compressorjs/1.2.1/compressor.min.js"></script>
     <style>
         body {
@@ -244,7 +244,7 @@
     </style>
 </head>
 <body>
-<h1>文件上传</h1>
+<h1>内部工具</h1>
 <div id="error-message"></div>
 <div id="content" style="display: none;">
     <div id="upload-form">
@@ -303,7 +303,7 @@
     function showError(message) {
         errorMessage.innerHTML = message;
         if (window.self === window.top) {
-            errorMessage.innerHTML += '<br/><div style="font-size: 12px;margin-top:10px">注意: 本上传入口已关闭，请从其它入口进入</div>';
+            errorMessage.innerHTML += '<br/><div style="font-size: 12px;margin-top:10px">注意: 本入口已关闭，请从其它入口进入</div>';
         }
         errorMessage.style.display = 'block';
     }
