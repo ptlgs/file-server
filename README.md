@@ -47,7 +47,7 @@ export CACHE_MAX_BYTES=10Gi                           # optional explicit cache 
 export CACHE_MIN_FREE_BYTES=1Gi                       # optional filesystem free-space reserve
 ```
 
-On startup the server logs the detected cache filesystem size. In Kubernetes, this reflects the PVC when `CACHE_DIR` points at the mounted PVC path.
+On startup the server logs the detected cache filesystem size. Some Kubernetes storage backends report the backing host/NFS filesystem size instead of the PVC request; set `CACHE_MAX_BYTES` when the detected size is not the usable cache budget.
 
 The legacy `/e` and `/upload` endpoints are still present for compatibility, but the UI uses the chunked encrypted upload flow.
 

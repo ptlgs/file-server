@@ -184,6 +184,14 @@ function resolveCacheMaxBytes(totalBytes) {
     return Math.floor(totalBytes * CACHE_MAX_USAGE_RATIO);
 }
 
+function getCacheMaxBytesSource() {
+    if (CONFIGURED_CACHE_MAX_BYTES !== undefined) {
+        return 'CACHE_MAX_BYTES';
+    }
+
+    return `detected filesystem * ${CACHE_MAX_USAGE_RATIO}`;
+}
+
 function resolveCacheMinFreeBytes(totalBytes) {
     if (CONFIGURED_CACHE_MIN_FREE_BYTES !== undefined) {
         return CONFIGURED_CACHE_MIN_FREE_BYTES;
@@ -379,7 +387,7 @@ async function initializeFileCache() {
         const minFreeBytes = resolveCacheMinFreeBytes(stats.totalBytes);
 
         console.log(`File cache directory: ${CACHE_DIR}`);
-        console.log(`Detected file cache filesystem: total=${formatBytes(stats.totalBytes)}, available=${formatBytes(stats.availableBytes)}, free=${formatBytes(stats.freeBytes)}, max cache=${formatBytes(cacheMaxBytes)}, min free=${formatBytes(minFreeBytes)}`);
+        console.log(`Detected file cache filesystem: total=${formatBytes(stats.totalBytes)}, available=${formatBytes(stats.availableBytes)}, free=${formatBytes(stats.freeBytes)}, max cache=${formatBytes(cacheMaxBytes)} (${getCacheMaxBytesSource()}), min free=${formatBytes(minFreeBytes)}`);
 
         const result = await runCacheCleanup(0, 'startup');
         console.log(`File cache startup usage: ${formatBytes(result.usageBytes)}`);
