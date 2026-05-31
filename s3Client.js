@@ -1,7 +1,24 @@
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const { HttpProxyAgent, HttpsProxyAgent } = require('hpagent');
 
 const endpoint = process.env.S3_ENDPOINT;
 const fullEndpoint = endpoint.startsWith('http') ? endpoint : `https://${endpoint}`;
+const s3Proxy = process.env.S3_PROXY || process.env.PROXY;
+
+function createS3RequestHandler() {
+    if (!s3Proxy) {
+        return undefined;
+    }
+
+    return new NodeHttpHandler({
+        httpAgent: new HttpProxyAgent({proxy: s3Proxy}),
+        httpsAgent: new HttpsProxyAgent({proxy: s3Proxy}),
+    });
+}
 
 const s3Client = new S3Client({
     endpoint: fullEndpoint,
@@ -12,7 +29,8 @@ const s3Client = new S3Client({
     },
     forcePathStyle: true,
     checksumAlgorithm: null,
-    computeChecksums: false
+    computeChecksums: false,
+    requestHandler: createS3RequestHandler(),
 });
 
 const bucketName = process.env.S3_BUCKET;
