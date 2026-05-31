@@ -9,7 +9,6 @@ import axios from 'axios';
 import {HttpsProxyAgent} from 'https-proxy-agent';
 import {getFile, uploadFile} from './s3Client.js';
 import {decrypt, encrypt} from './encryption.js';
-import {DiskStore} from 'cache-manager-fs-hash';
 import jwt from 'jsonwebtoken';
 import cors from 'cors';
 import {Client as ESClient} from '@elastic/elasticsearch';
@@ -55,12 +54,6 @@ let cacheUsageBytes = 0;
 let cacheCleanupPromise = Promise.resolve();
 
 mkdirSync(CACHE_DIR, {recursive: true});
-
-const fileCache = new DiskStore({
-    path: CACHE_DIR,
-    ttl: FILE_CACHE_TTL_MS,
-    zip: false,
-});
 
 const MAX_FILE_SIZE = parseInt(process.env.MAX_UPLOAD_BYTES || `${500 * 1024 * 1024}`, 10);
 const MAX_UPLOAD_CHUNK_SIZE = parseInt(process.env.MAX_UPLOAD_CHUNK_BYTES || `${8 * 1024 * 1024}`, 10);
@@ -202,25 +195,58 @@ function resolveCacheMinFreeBytes(totalBytes) {
 
 function getCacheEntryBaseByKey(key) {
     const hash = crypto.createHash('md5').update(`${key}`).digest('hex');
-    return path.join(CACHE_DIR, `diskstore-${hash.substring(0, 3)}`, hash.substring(3));
+    return path.join(CACHE_DIR, `filecache-${hash.substring(0, 3)}`, hash.substring(3));
 }
 
-function getCacheEntryBaseByFilePath(filePath) {
-    const normalized = filePath.replaceAll(path.sep, '/');
-    if (!/\/diskstore-[0-9a-f]{3}\//i.test(normalized)) {
+function getCacheEntryInfoByFilePath(filePath) {
+    const dir = path.dirname(filePath);
+    const dirName = path.basename(dir);
+    const fileName = path.basename(filePath);
+
+    if (/^filecache-[0-9a-f]{3}$/i.test(dirName)) {
+        if (fileName.endsWith('.json')) {
+            return {
+                basePath: path.join(dir, fileName.slice(0, -'.json'.length)),
+                format: 'raw',
+            };
+        }
+
+        if (fileName.endsWith('.bin')) {
+            return {
+                basePath: path.join(dir, fileName.slice(0, -'.bin'.length)),
+                format: 'raw',
+            };
+        }
+
         return null;
     }
 
-    if (filePath.endsWith('.json')) {
-        return filePath.slice(0, -'.json'.length);
-    }
+    if (/^diskstore-[0-9a-f]{3}$/i.test(dirName)) {
+        if (fileName.endsWith('.json')) {
+            return {
+                basePath: path.join(dir, fileName.slice(0, -'.json'.length)),
+                format: 'legacy-diskstore',
+            };
+        }
 
-    const binMatch = filePath.match(/-\d+\.bin$/);
-    if (binMatch) {
-        return filePath.slice(0, -binMatch[0].length);
+        const binMatch = fileName.match(/-\d+\.bin$/);
+        if (binMatch) {
+            return {
+                basePath: path.join(dir, fileName.slice(0, -binMatch[0].length)),
+                format: 'legacy-diskstore',
+            };
+        }
     }
 
     return null;
+}
+
+function getCacheDataPath(basePath) {
+    return `${basePath}.bin`;
+}
+
+function getCacheMetadataPath(basePath) {
+    return `${basePath}.json`;
 }
 
 function estimateCacheEntryBytes(dataLength) {
@@ -271,14 +297,16 @@ async function collectCacheEntries() {
     const entriesByBase = new Map();
 
     await walkCacheFiles(CACHE_DIR, async (filePath) => {
-        const basePath = getCacheEntryBaseByFilePath(filePath);
-        if (!basePath) {
+        const cacheEntryInfo = getCacheEntryInfoByFilePath(filePath);
+        if (!cacheEntryInfo) {
             return;
         }
 
+        const {basePath, format} = cacheEntryInfo;
         const stat = await fs.stat(filePath);
         const entry = entriesByBase.get(basePath) || {
             basePath,
+            format,
             files: [],
             size: 0,
             lastAccessedMs: 0,
@@ -307,13 +335,17 @@ async function collectCacheEntries() {
 }
 
 async function deleteCacheEntry(entry) {
-    if (entry.key) {
-        await fileCache.del(entry.key);
-    } else {
-        await Promise.all(entry.files.map(filePath => fs.rm(filePath, {force: true})));
-    }
-
+    await Promise.all(entry.files.map(filePath => fs.rm(filePath, {force: true})));
     await fs.rmdir(path.dirname(entry.basePath)).catch(() => 0);
+}
+
+async function deleteCacheEntryByKey(key) {
+    const basePath = getCacheEntryBaseByKey(key);
+    await Promise.all([
+        fs.rm(getCacheDataPath(basePath), {force: true}),
+        fs.rm(getCacheMetadataPath(basePath), {force: true}),
+    ]);
+    await fs.rmdir(path.dirname(basePath)).catch(() => 0);
 }
 
 async function evictCacheEntries(entries, bytesToFree, reason) {
@@ -398,35 +430,67 @@ async function initializeFileCache() {
 
 async function touchCacheEntry(key) {
     const basePath = getCacheEntryBaseByKey(key);
-    const dir = path.dirname(basePath);
-    const basename = path.basename(basePath);
     const now = new Date();
 
-    let entries;
-    try {
-        entries = await fs.readdir(dir);
-    } catch (error) {
-        if (error.code === 'ENOENT') {
-            return;
-        }
-        throw error;
-    }
-
-    await Promise.all(entries
-        .filter(entry => entry === `${basename}.json` || (entry.startsWith(`${basename}-`) && entry.endsWith('.bin')))
-        .map(entry => fs.utimes(path.join(dir, entry), now, now).catch(() => 0)));
+    await Promise.all([
+        fs.utimes(getCacheDataPath(basePath), now, now).catch(() => 0),
+        fs.utimes(getCacheMetadataPath(basePath), now, now).catch(() => 0),
+    ]);
 }
 
 async function getCachedFileData(key) {
+    const basePath = getCacheEntryBaseByKey(key);
+
     try {
-        const cachedData = await fileCache.get(key);
-        if (cachedData) {
-            await touchCacheEntry(key);
+        const metadata = JSON.parse(await fs.readFile(getCacheMetadataPath(basePath), 'utf8'));
+
+        if (metadata.key !== key) {
+            return undefined;
         }
+
+        if (metadata.expireTime && metadata.expireTime <= Date.now()) {
+            await deleteCacheEntryByKey(key);
+            return undefined;
+        }
+
+        const cachedData = await fs.readFile(getCacheDataPath(basePath));
+        await touchCacheEntry(key);
         return cachedData;
     } catch (error) {
+        if (error.code === 'ENOENT') {
+            return undefined;
+        }
+
         console.warn(`Failed to read file cache for ${key}:`, error.message);
         return undefined;
+    }
+}
+
+async function writeCacheEntry(key, fileData) {
+    const basePath = getCacheEntryBaseByKey(key);
+    const dir = path.dirname(basePath);
+    const tempSuffix = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+    const tempDataPath = `${getCacheDataPath(basePath)}.${tempSuffix}`;
+    const tempMetadataPath = `${getCacheMetadataPath(basePath)}.${tempSuffix}`;
+    const metadata = {
+        key,
+        expireTime: Date.now() + FILE_CACHE_TTL_MS,
+        size: fileData.length,
+    };
+
+    await fs.mkdir(dir, {recursive: true});
+
+    try {
+        await fs.writeFile(tempDataPath, fileData);
+        await fs.writeFile(tempMetadataPath, JSON.stringify(metadata));
+        await fs.rename(tempDataPath, getCacheDataPath(basePath));
+        await fs.rename(tempMetadataPath, getCacheMetadataPath(basePath));
+    } catch (error) {
+        await Promise.all([
+            fs.rm(tempDataPath, {force: true}),
+            fs.rm(tempMetadataPath, {force: true}),
+        ]);
+        throw error;
     }
 }
 
@@ -448,7 +512,7 @@ async function cacheFileData(key, fileData) {
             await runCacheCleanup(estimatedBytes, 'making room for cache write');
         }
 
-        await fileCache.set(key, fileData);
+        await writeCacheEntry(key, fileData);
         cacheUsageBytes += estimatedBytes;
         await touchCacheEntry(key);
     } catch (error) {
@@ -460,7 +524,7 @@ async function cacheFileData(key, fileData) {
         try {
             console.warn(`Cache write for ${key} ran out of disk space; evicting LRU entries and retrying`);
             await runCacheCleanup(estimatedBytes, 'recovering from low disk space');
-            await fileCache.set(key, fileData);
+            await writeCacheEntry(key, fileData);
             cacheUsageBytes += estimatedBytes;
             await touchCacheEntry(key);
         } catch (retryError) {
