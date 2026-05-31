@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import crypto from 'crypto';
 import fs from 'fs/promises';
-import {createReadStream} from 'fs';
+import {createReadStream, mkdirSync} from 'fs';
 import os from 'os';
 import path from 'path';
 import axios from 'axios';
@@ -45,13 +45,22 @@ async function writeLogToElasticsearch(logEntry) {
     }
 }
 
+const CACHE_DIR = path.resolve(process.env.CACHE_DIR || 'diskcache');
+const FILE_CACHE_TTL_MS = parseIntegerEnv('CACHE_TTL_MS', 86400 * 3 * 1000);
+const CACHE_MAX_USAGE_RATIO = parseRatioEnv('CACHE_MAX_USAGE_RATIO', 0.9);
+const CONFIGURED_CACHE_MAX_BYTES = parseByteSizeEnv('CACHE_MAX_BYTES');
+const CONFIGURED_CACHE_MIN_FREE_BYTES = parseByteSizeEnv('CACHE_MIN_FREE_BYTES');
+let cacheMaxBytes = CONFIGURED_CACHE_MAX_BYTES;
+let cacheUsageBytes = 0;
+let cacheCleanupPromise = Promise.resolve();
+
+mkdirSync(CACHE_DIR, {recursive: true});
+
 const fileCache = new DiskStore({
-    path: 'diskcache',
-    ttl: 86400 * 3 * 1000,
+    path: CACHE_DIR,
+    ttl: FILE_CACHE_TTL_MS,
     zip: false,
 });
-
-const hitCounter = new Map();
 
 const MAX_FILE_SIZE = parseInt(process.env.MAX_UPLOAD_BYTES || `${500 * 1024 * 1024}`, 10);
 const MAX_UPLOAD_CHUNK_SIZE = parseInt(process.env.MAX_UPLOAD_CHUNK_BYTES || `${8 * 1024 * 1024}`, 10);
@@ -84,6 +93,372 @@ app.use(express.static('public'));
 
 function calculateSHA256(buffer) {
     return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+function parseIntegerEnv(name, fallback) {
+    const value = process.env[name];
+    if (!value) {
+        return fallback;
+    }
+
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isSafeInteger(parsed) && parsed > 0) {
+        return parsed;
+    }
+
+    console.warn(`Invalid ${name} value "${value}", using ${fallback}`);
+    return fallback;
+}
+
+function parseRatioEnv(name, fallback) {
+    const value = process.env[name];
+    if (!value) {
+        return fallback;
+    }
+
+    const parsed = Number.parseFloat(value);
+    if (Number.isFinite(parsed) && parsed > 0 && parsed <= 1) {
+        return parsed;
+    }
+
+    console.warn(`Invalid ${name} value "${value}", using ${fallback}`);
+    return fallback;
+}
+
+function parseByteSizeEnv(name) {
+    const value = process.env[name];
+    if (!value) {
+        return undefined;
+    }
+
+    const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*(b|k|kb|ki|kib|m|mb|mi|mib|g|gb|gi|gib|t|tb|ti|tib)?$/i);
+    if (!match) {
+        console.warn(`Invalid ${name} value "${value}", ignoring it`);
+        return undefined;
+    }
+
+    const units = {
+        b: 1,
+        k: 1024,
+        kb: 1024,
+        ki: 1024,
+        kib: 1024,
+        m: 1024 ** 2,
+        mb: 1024 ** 2,
+        mi: 1024 ** 2,
+        mib: 1024 ** 2,
+        g: 1024 ** 3,
+        gb: 1024 ** 3,
+        gi: 1024 ** 3,
+        gib: 1024 ** 3,
+        t: 1024 ** 4,
+        tb: 1024 ** 4,
+        ti: 1024 ** 4,
+        tib: 1024 ** 4,
+    };
+    const unit = (match[2] || 'b').toLowerCase();
+    return Math.floor(Number.parseFloat(match[1]) * units[unit]);
+}
+
+function formatBytes(bytes) {
+    if (!Number.isFinite(bytes)) {
+        return 'unknown';
+    }
+
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+    }
+
+    return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function resolveCacheMaxBytes(totalBytes) {
+    if (CONFIGURED_CACHE_MAX_BYTES !== undefined) {
+        return CONFIGURED_CACHE_MAX_BYTES;
+    }
+
+    return Math.floor(totalBytes * CACHE_MAX_USAGE_RATIO);
+}
+
+function resolveCacheMinFreeBytes(totalBytes) {
+    if (CONFIGURED_CACHE_MIN_FREE_BYTES !== undefined) {
+        return CONFIGURED_CACHE_MIN_FREE_BYTES;
+    }
+
+    return Math.floor(Math.min(1024 ** 3, Math.max(128 * 1024 ** 2, totalBytes * 0.1)));
+}
+
+function getCacheEntryBaseByKey(key) {
+    const hash = crypto.createHash('md5').update(`${key}`).digest('hex');
+    return path.join(CACHE_DIR, `diskstore-${hash.substring(0, 3)}`, hash.substring(3));
+}
+
+function getCacheEntryBaseByFilePath(filePath) {
+    const normalized = filePath.replaceAll(path.sep, '/');
+    if (!/\/diskstore-[0-9a-f]{3}\//i.test(normalized)) {
+        return null;
+    }
+
+    if (filePath.endsWith('.json')) {
+        return filePath.slice(0, -'.json'.length);
+    }
+
+    const binMatch = filePath.match(/-\d+\.bin$/);
+    if (binMatch) {
+        return filePath.slice(0, -binMatch[0].length);
+    }
+
+    return null;
+}
+
+function estimateCacheEntryBytes(dataLength) {
+    return dataLength + 16 * 1024;
+}
+
+function isNoSpaceError(error) {
+    return error && (error.code === 'ENOSPC' || error.code === 'EDQUOT');
+}
+
+async function getCacheFilesystemStats() {
+    await fs.mkdir(CACHE_DIR, {recursive: true});
+    const stats = await fs.statfs(CACHE_DIR);
+    const blockSize = stats.bsize || 1;
+
+    return {
+        totalBytes: stats.blocks * blockSize,
+        freeBytes: stats.bfree * blockSize,
+        availableBytes: stats.bavail * blockSize,
+    };
+}
+
+async function walkCacheFiles(dir, visitFile) {
+    let entries;
+    try {
+        entries = await fs.readdir(dir, {withFileTypes: true});
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return;
+        }
+        throw error;
+    }
+
+    await Promise.all(entries.map(async (entry) => {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            await walkCacheFiles(fullPath, visitFile);
+            return;
+        }
+
+        if (entry.isFile()) {
+            await visitFile(fullPath);
+        }
+    }));
+}
+
+async function collectCacheEntries() {
+    const entriesByBase = new Map();
+
+    await walkCacheFiles(CACHE_DIR, async (filePath) => {
+        const basePath = getCacheEntryBaseByFilePath(filePath);
+        if (!basePath) {
+            return;
+        }
+
+        const stat = await fs.stat(filePath);
+        const entry = entriesByBase.get(basePath) || {
+            basePath,
+            files: [],
+            size: 0,
+            lastAccessedMs: 0,
+            key: null,
+            expireTime: null,
+        };
+
+        entry.files.push(filePath);
+        entry.size += stat.size;
+        entry.lastAccessedMs = Math.max(entry.lastAccessedMs, stat.mtimeMs);
+
+        if (filePath.endsWith('.json')) {
+            try {
+                const data = JSON.parse(await fs.readFile(filePath, 'utf8'));
+                entry.key = data.key;
+                entry.expireTime = data.expireTime;
+            } catch (error) {
+                console.warn(`Failed to read cache metadata ${filePath}:`, error.message);
+            }
+        }
+
+        entriesByBase.set(basePath, entry);
+    });
+
+    return Array.from(entriesByBase.values());
+}
+
+async function deleteCacheEntry(entry) {
+    if (entry.key) {
+        await fileCache.del(entry.key);
+    } else {
+        await Promise.all(entry.files.map(filePath => fs.rm(filePath, {force: true})));
+    }
+
+    await fs.rmdir(path.dirname(entry.basePath)).catch(() => 0);
+}
+
+async function evictCacheEntries(entries, bytesToFree, reason) {
+    let freedBytes = 0;
+    let evictedCount = 0;
+
+    entries.sort((a, b) => a.lastAccessedMs - b.lastAccessedMs);
+
+    for (const entry of entries) {
+        if (freedBytes >= bytesToFree) {
+            break;
+        }
+
+        try {
+            await deleteCacheEntry(entry);
+            freedBytes += entry.size;
+            evictedCount++;
+        } catch (error) {
+            console.warn(`Failed to evict cache entry ${entry.key || entry.basePath}:`, error.message);
+        }
+    }
+
+    if (evictedCount > 0) {
+        console.log(`File cache LRU evicted ${evictedCount} entries, freed about ${formatBytes(freedBytes)} (${reason})`);
+    }
+
+    return freedBytes;
+}
+
+async function enforceCacheLimits(requiredBytes = 0, reason = 'cache limit') {
+    const stats = await getCacheFilesystemStats();
+    cacheMaxBytes = resolveCacheMaxBytes(stats.totalBytes);
+    const minFreeBytes = resolveCacheMinFreeBytes(stats.totalBytes);
+    let entries = await collectCacheEntries();
+    let usageBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
+    let freedBytes = 0;
+
+    const now = Date.now();
+    const expiredEntries = entries.filter(entry => entry.expireTime && entry.expireTime <= now);
+    if (expiredEntries.length > 0) {
+        freedBytes += await evictCacheEntries(expiredEntries, Infinity, 'expired cache entries');
+        entries = entries.filter(entry => !(entry.expireTime && entry.expireTime <= now));
+        usageBytes = Math.max(0, usageBytes - freedBytes);
+    }
+
+    const expectedAvailableBytes = stats.availableBytes + freedBytes;
+    const maxSizeShortfall = Math.max(0, usageBytes + requiredBytes - cacheMaxBytes);
+    const freeSpaceShortfall = Math.max(0, minFreeBytes + requiredBytes - expectedAvailableBytes);
+    const bytesToFree = Math.max(maxSizeShortfall, freeSpaceShortfall);
+
+    if (bytesToFree > 0) {
+        const lruFreedBytes = await evictCacheEntries(entries, bytesToFree, reason);
+        freedBytes += lruFreedBytes;
+        usageBytes = Math.max(0, usageBytes - lruFreedBytes);
+    }
+
+    cacheUsageBytes = usageBytes;
+    return {usageBytes, freedBytes, stats, minFreeBytes};
+}
+
+async function runCacheCleanup(requiredBytes = 0, reason = 'cache limit') {
+    const cleanup = cacheCleanupPromise.then(() => enforceCacheLimits(requiredBytes, reason));
+    cacheCleanupPromise = cleanup.catch(() => 0);
+    return cleanup;
+}
+
+async function initializeFileCache() {
+    try {
+        const stats = await getCacheFilesystemStats();
+        cacheMaxBytes = resolveCacheMaxBytes(stats.totalBytes);
+        const minFreeBytes = resolveCacheMinFreeBytes(stats.totalBytes);
+
+        console.log(`File cache directory: ${CACHE_DIR}`);
+        console.log(`Detected file cache filesystem: total=${formatBytes(stats.totalBytes)}, available=${formatBytes(stats.availableBytes)}, free=${formatBytes(stats.freeBytes)}, max cache=${formatBytes(cacheMaxBytes)}, min free=${formatBytes(minFreeBytes)}`);
+
+        const result = await runCacheCleanup(0, 'startup');
+        console.log(`File cache startup usage: ${formatBytes(result.usageBytes)}`);
+    } catch (error) {
+        console.warn('Failed to initialize file cache limits:', error.message);
+    }
+}
+
+async function touchCacheEntry(key) {
+    const basePath = getCacheEntryBaseByKey(key);
+    const dir = path.dirname(basePath);
+    const basename = path.basename(basePath);
+    const now = new Date();
+
+    let entries;
+    try {
+        entries = await fs.readdir(dir);
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return;
+        }
+        throw error;
+    }
+
+    await Promise.all(entries
+        .filter(entry => entry === `${basename}.json` || (entry.startsWith(`${basename}-`) && entry.endsWith('.bin')))
+        .map(entry => fs.utimes(path.join(dir, entry), now, now).catch(() => 0)));
+}
+
+async function getCachedFileData(key) {
+    try {
+        const cachedData = await fileCache.get(key);
+        if (cachedData) {
+            await touchCacheEntry(key);
+        }
+        return cachedData;
+    } catch (error) {
+        console.warn(`Failed to read file cache for ${key}:`, error.message);
+        return undefined;
+    }
+}
+
+async function cacheFileData(key, fileData) {
+    const estimatedBytes = estimateCacheEntryBytes(fileData.length);
+
+    if (cacheMaxBytes !== undefined && estimatedBytes > cacheMaxBytes) {
+        console.warn(`Skipping cache for ${key}: file size ${formatBytes(fileData.length)} exceeds cache max ${formatBytes(cacheMaxBytes)}`);
+        return;
+    }
+
+    try {
+        const stats = await getCacheFilesystemStats();
+        const minFreeBytes = resolveCacheMinFreeBytes(stats.totalBytes);
+        const needsCleanup = stats.availableBytes - estimatedBytes < minFreeBytes ||
+            (cacheMaxBytes !== undefined && cacheUsageBytes + estimatedBytes > cacheMaxBytes);
+
+        if (needsCleanup) {
+            await runCacheCleanup(estimatedBytes, 'making room for cache write');
+        }
+
+        await fileCache.set(key, fileData);
+        cacheUsageBytes += estimatedBytes;
+        await touchCacheEntry(key);
+    } catch (error) {
+        if (!isNoSpaceError(error)) {
+            console.warn(`Failed to cache file ${key}:`, error.message);
+            return;
+        }
+
+        try {
+            console.warn(`Cache write for ${key} ran out of disk space; evicting LRU entries and retrying`);
+            await runCacheCleanup(estimatedBytes, 'recovering from low disk space');
+            await fileCache.set(key, fileData);
+            cacheUsageBytes += estimatedBytes;
+            await touchCacheEntry(key);
+        } catch (retryError) {
+            console.warn(`Failed to cache file ${key} after LRU eviction:`, retryError.message);
+        }
+    }
 }
 
 function getUserInfo(req) {
@@ -583,7 +958,7 @@ app.get('/:sha256/:filename', async (req, res) => {
         });
 
         // Check if the file is in cache
-        const cachedData = await fileCache.get(key);
+        const cachedData = await getCachedFileData(key);
         if (cachedData) {
             res.contentType(filename);
             return res.send(cachedData);
@@ -591,11 +966,7 @@ app.get('/:sha256/:filename', async (req, res) => {
 
         const encryptedData = await getFile(key);
         let fileData = decrypt(encryptedData);
-        hitCounter.set(key, (hitCounter.get(key) || 0) + 1);
-
-        if (hitCounter.get(key) >= 8 && fileData.length <= MAX_FILE_SIZE) {
-            await fileCache.set(key, fileData);
-        }
+        await cacheFileData(key, fileData);
 
         res.contentType(filename);
         res.send(fileData);
@@ -780,6 +1151,7 @@ function escapeRegExp(string) {
 }
 
 const MAIN_PORT = parseInt(process.env.MAIN_PORT || process.env.PORT || '3000');
+await initializeFileCache();
 app.listen(MAIN_PORT, () => {
     console.log(`Main server running on port ${MAIN_PORT}`);
 });
