@@ -17,12 +17,18 @@ const s3Client = new S3Client({
 
 const bucketName = process.env.S3_BUCKET;
 
-async function uploadFile(key, data) {
-    const command = new PutObjectCommand({
+async function uploadFile(key, data, options = {}) {
+    const putObjectInput = {
         Bucket: bucketName,
         Key: key,
         Body: data,
-    });
+    };
+
+    if (Number.isSafeInteger(options.contentLength)) {
+        putObjectInput.ContentLength = options.contentLength;
+    }
+
+    const command = new PutObjectCommand(putObjectInput);
 
     try {
         const response = await s3Client.send(command);

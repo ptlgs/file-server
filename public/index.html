@@ -172,6 +172,41 @@
             display: flex;
             justify-content: center;
             align-items: center;
+            flex-direction: column;
+            gap: 8px;
+            padding: 12px;
+            box-sizing: border-box;
+            text-align: center;
+        }
+
+        .upload-status {
+            font-size: 12px;
+            color: #333;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .upload-progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #ddd;
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .upload-progress-fill {
+            width: 0%;
+            height: 100%;
+            background: #4CAF50;
+            transition: width 0.2s ease;
+        }
+
+        .upload-meta {
+            font-size: 11px;
+            color: #555;
+            line-height: 1.4;
         }
 
         #finish-button {
@@ -530,36 +565,207 @@
                 return;
             }
 
-            // Create a tile for the file with a loading indicator
-            const tile = createFileTile(file);
-
             if (uploadingFiles.has(file.name)) return;
             uploadingFiles.add(file.name);
 
+            // Create a tile for the file with a loading indicator
+            const tile = createFileTile(file);
+            const controller = new AbortController();
+            uploadControllers[file.name] = controller;
+
+            let uploadId = null;
+            let uploadFullyCompleted = false;
+            let shouldAbortRemoteSession = true;
+
             try {
-                const controller = new AbortController();
+                const totalChunks = Math.ceil(file.size / CHUNKED_UPLOAD_CHUNK_SIZE);
+                const startedAt = performance.now();
+                let committedBytes = 0;
 
-                uploadControllers[file.name] = controller;
+                updateFileProgress(tile, {
+                    uploadedBytes: 0,
+                    totalBytes: file.size,
+                    startedAt,
+                    status: '准备上传...'
+                });
 
-                // Read file as ArrayBuffer
-                const fileData = await file.arrayBuffer();
+                const key = await getUploadEncryptionKey();
+                const initResponse = await fetchJsonWithRetry('/e/chunk/init', {
+                    filename: file.name,
+                    fileSize: file.size,
+                    chunkSize: CHUNKED_UPLOAD_CHUNK_SIZE,
+                    totalChunks
+                }, token, controller.signal, {
+                    status: '正在建立上传会话...',
+                    tile,
+                    uploadedBytes: 0,
+                    totalBytes: file.size,
+                    startedAt
+                });
 
-                // Generate IV
-                const iv = crypto.getRandomValues(new Uint8Array(16));
+                uploadId = initResponse.uploadId;
+                controller.uploadId = uploadId;
 
-                // Derive key from pre-shared secret
-                const keyMaterial = await crypto.subtle.importKey(
+                const receivedChunks = new Set(initResponse.received || []);
+
+                for (let index = 0; index < totalChunks; index++) {
+                    if (controller.signal.aborted) {
+                        throw createAbortError();
+                    }
+
+                    const start = index * CHUNKED_UPLOAD_CHUNK_SIZE;
+                    const end = Math.min(start + CHUNKED_UPLOAD_CHUNK_SIZE, file.size);
+                    const chunk = file.slice(start, end);
+
+                    if (receivedChunks.has(index)) {
+                        committedBytes += chunk.size;
+                        updateFileProgress(tile, {
+                            uploadedBytes: committedBytes,
+                            totalBytes: file.size,
+                            startedAt,
+                            status: `继续上传：已跳过第 ${index + 1}/${totalChunks} 片`
+                        });
+                        continue;
+                    }
+
+                    await waitUntilOnline(controller.signal, tile, {
+                        uploadedBytes: committedBytes,
+                        totalBytes: file.size,
+                        startedAt
+                    });
+
+                    updateFileProgress(tile, {
+                        uploadedBytes: committedBytes,
+                        totalBytes: file.size,
+                        startedAt,
+                        status: `正在加密第 ${index + 1}/${totalChunks} 片...`
+                    });
+
+                    const plainBuffer = await chunk.arrayBuffer();
+                    const chunkSHA256 = await sha256Hex(plainBuffer);
+                    const encryptedBody = await encryptChunkForUpload(plainBuffer, key);
+
+                    await uploadEncryptedChunkWithRetry({
+                        uploadId,
+                        chunkIndex: index,
+                        totalChunks,
+                        chunkSHA256,
+                        encryptedBody,
+                        chunkBytes: chunk.size,
+                        committedBytes,
+                        totalBytes: file.size,
+                        startedAt,
+                        token,
+                        controller,
+                        tile
+                    });
+
+                    committedBytes += chunk.size;
+                    updateFileProgress(tile, {
+                        uploadedBytes: committedBytes,
+                        totalBytes: file.size,
+                        startedAt,
+                        status: `第 ${index + 1}/${totalChunks} 片已完成`
+                    });
+                }
+
+                shouldAbortRemoteSession = false;
+                updateFileProgress(tile, {
+                    uploadedBytes: file.size,
+                    totalBytes: file.size,
+                    startedAt,
+                    status: '正在合并并保存文件...'
+                });
+
+                let data;
+                try {
+                    data = await fetchJsonWithRetry('/e/chunk/complete', {uploadId}, token, controller.signal, {
+                        status: '正在合并并保存文件...',
+                        tile,
+                        uploadedBytes: file.size,
+                        totalBytes: file.size,
+                        startedAt,
+                        maxAttempts: 3
+                    });
+                } catch (completeError) {
+                    const statusData = await fetchJsonWithRetry('/e/chunk/status', {uploadId}, token, controller.signal, {
+                        status: '正在确认上传结果...',
+                        tile,
+                        uploadedBytes: file.size,
+                        totalBytes: file.size,
+                        startedAt,
+                        maxAttempts: 2
+                    }).catch(() => null);
+
+                    if (statusData && statusData.completed && statusData.url) {
+                        data = {url: statusData.url};
+                    } else {
+                        throw completeError;
+                    }
+                }
+
+                uploadFullyCompleted = true;
+
+                if (document.body.contains(tile)) {
+                    const fixedUrl = data.url;
+                    updateFileTile(tile, fixedUrl, file);
+                    uploadedFiles.push({name: file.name, url: fixedUrl});
+
+                    if (wantsCallback && singleUpload) {
+                        window.parent.postMessage({
+                            type: 'UPLOAD_COMPLETE',
+                            files: [new URL(fixedUrl, window.location.origin).href],
+                            sessionId: sessionId,
+                        }, '*');
+
+                        document.getElementById('upload-form').style.display = 'none';
+                        uploadCompleted = true; // Prevent further uploads
+                    } else if (wantsCallback) {
+                        addFinishButton();
+                    }
+                }
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    console.log(`Upload canceled for ${file.name}`);
+                } else {
+                    console.error('Upload error:', error);
+                    showError(`上传 "${file.name}" 时发生错误：${error.message || '网络或服务器错误'}`);
+                    tile.remove();
+                }
+            } finally {
+                if (!uploadFullyCompleted && shouldAbortRemoteSession && uploadId) {
+                    abortChunkUpload(uploadId, token);
+                }
+                uploadingFiles.delete(file.name);
+                delete uploadControllers[file.name]; // Clean up
+            }
+        }
+
+        const CHUNKED_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
+        const MAX_CHUNK_UPLOAD_ATTEMPTS = 5;
+        const CHUNK_UPLOAD_TIMEOUT_MS = 120000;
+        const RETRY_BASE_DELAY_MS = 800;
+        let uploadEncryptionKeyPromise = null;
+
+        function createAbortError() {
+            const error = new Error('Upload aborted');
+            error.name = 'AbortError';
+            return error;
+        }
+
+        function getUploadEncryptionKey() {
+            if (!uploadEncryptionKeyPromise) {
+                const encoder = new TextEncoder();
+                uploadEncryptionKeyPromise = crypto.subtle.importKey(
                     'raw',
-                    new TextEncoder().encode("fDfl4koWS3GR"),
+                    encoder.encode('fDfl4koWS3GR'),
                     'PBKDF2',
                     false,
                     ['deriveKey']
-                );
-
-                const key = await crypto.subtle.deriveKey(
+                ).then(keyMaterial => crypto.subtle.deriveKey(
                     {
                         name: 'PBKDF2',
-                        salt: new TextEncoder().encode('salt'),
+                        salt: encoder.encode('salt'),
                         iterations: 100000,
                         hash: 'SHA-256'
                     },
@@ -567,64 +773,304 @@
                     {name: 'AES-GCM', length: 256},
                     false,
                     ['encrypt']
-                );
+                ));
+            }
+            return uploadEncryptionKeyPromise;
+        }
 
-                // Encrypt
-                const encrypted = await crypto.subtle.encrypt(
-                    {name: 'AES-GCM', iv},
-                    key,
-                    fileData
-                );
+        async function encryptChunkForUpload(plainBuffer, key) {
+            const iv = crypto.getRandomValues(new Uint8Array(16));
+            const encrypted = await crypto.subtle.encrypt({name: 'AES-GCM', iv}, key, plainBuffer);
+            const combined = new Uint8Array(iv.length + encrypted.byteLength);
+            combined.set(iv);
+            combined.set(new Uint8Array(encrypted), iv.length);
+            return combined;
+        }
 
-                // Combine IV and encrypted data
-                const combined = new Uint8Array(iv.length + encrypted.byteLength);
-                combined.set(iv);
-                combined.set(new Uint8Array(encrypted), iv.length);
+        async function sha256Hex(buffer) {
+            const digest = await crypto.subtle.digest('SHA-256', buffer);
+            return Array.from(new Uint8Array(digest))
+                .map(byte => byte.toString(16).padStart(2, '0'))
+                .join('');
+        }
 
-                const response = await fetch(`/e?token=${token}`, {
-                    method: 'POST',
-                    body: combined,
-                    headers: {'Content-Type': 'application/octet-stream'},
-                    signal: controller.signal
+        async function fetchJsonWithRetry(path, body, token, signal, progress = {}) {
+            const maxAttempts = progress.maxAttempts || 4;
+            let attempt = 0;
+
+            while (attempt < maxAttempts) {
+                attempt++;
+                await waitUntilOnline(signal, progress.tile, progress);
+
+                if (progress.tile) {
+                    updateFileProgress(progress.tile, {
+                        uploadedBytes: progress.uploadedBytes || 0,
+                        totalBytes: progress.totalBytes || 0,
+                        startedAt: progress.startedAt || performance.now(),
+                        status: attempt === 1 ? progress.status : `${progress.status || '请求中'}（重试 ${attempt}/${maxAttempts}）`
+                    });
+                }
+
+                try {
+                    const response = await fetch(`${path}?token=${encodeURIComponent(token)}`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(body),
+                        signal
+                    });
+                    const data = await response.json().catch(() => ({}));
+
+                    if (!response.ok) {
+                        const error = new Error(data.error || `HTTP ${response.status}`);
+                        error.status = response.status;
+                        throw error;
+                    }
+
+                    return data;
+                } catch (error) {
+                    if (error.name === 'AbortError') {
+                        throw error;
+                    }
+                    if (!shouldRetryError(error) || attempt >= maxAttempts) {
+                        throw error;
+                    }
+                    await delayWithSignal(getRetryDelay(attempt), signal);
+                }
+            }
+        }
+
+        async function uploadEncryptedChunkWithRetry(options) {
+            let attempt = 0;
+
+            while (attempt < MAX_CHUNK_UPLOAD_ATTEMPTS) {
+                attempt++;
+                await waitUntilOnline(options.controller.signal, options.tile, {
+                    uploadedBytes: options.committedBytes,
+                    totalBytes: options.totalBytes,
+                    startedAt: options.startedAt
                 });
 
-                const data = await response.json();
-
-                if (response.ok) {
-                    // Check if the tile still exists (it might have been removed)
-                    if (document.body.contains(tile)) {
-                        const fixedUrl = data.url.replaceAll("______", file.name);
-                        updateFileTile(tile, fixedUrl, file);
-                        uploadedFiles.push({name: file.name, url: fixedUrl});
-
-                        if (wantsCallback && singleUpload) {
-                            window.parent.postMessage({
-                                type: 'UPLOAD_COMPLETE',
-                                files: [new URL(data.url, window.location.origin).href],
-                                sessionId: sessionId,
-                            }, '*');
-
-                            document.getElementById('upload-form').style.display = 'none';
-                            uploadCompleted = true; // Prevent further uploads
-                        } else if (wantsCallback) {
-                            addFinishButton();
-                        }
+                try {
+                    await uploadEncryptedChunkOnce({
+                        ...options,
+                        attempt,
+                        maxAttempts: MAX_CHUNK_UPLOAD_ATTEMPTS
+                    });
+                    return;
+                } catch (error) {
+                    if (error.name === 'AbortError') {
+                        throw error;
                     }
-                } else {
-                    showError(data.error || `上传 "${file.name}" 时发生错误。`);
-                    tile.remove();
+                    if (!shouldRetryError(error) || attempt >= MAX_CHUNK_UPLOAD_ATTEMPTS) {
+                        throw error;
+                    }
+
+                    updateFileProgress(options.tile, {
+                        uploadedBytes: options.committedBytes,
+                        totalBytes: options.totalBytes,
+                        startedAt: options.startedAt,
+                        status: `第 ${options.chunkIndex + 1}/${options.totalChunks} 片上传失败，正在重试 ${attempt + 1}/${MAX_CHUNK_UPLOAD_ATTEMPTS}...`
+                    });
+                    await delayWithSignal(getRetryDelay(attempt), options.controller.signal);
                 }
-            } catch (error) {
-                if (error.name === 'AbortError') {
-                    console.log(`Upload canceled for ${file.name}`);
-                } else {
-                    showError(`上传 "${file.name}" 时发生错误。`);
-                    tile.remove();
-                }
-            } finally {
-                uploadingFiles.delete(file.name);
-                delete uploadControllers[file.name]; // Clean up
             }
+        }
+
+        function uploadEncryptedChunkOnce(options) {
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                let settled = false;
+
+                const abortHandler = () => {
+                    if (!settled) {
+                        xhr.abort();
+                        reject(createAbortError());
+                    }
+                };
+
+                options.controller.signal.addEventListener('abort', abortHandler, {once: true});
+
+                xhr.open('POST', `/e/chunk?token=${encodeURIComponent(options.token)}`);
+                xhr.timeout = CHUNK_UPLOAD_TIMEOUT_MS;
+                xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                xhr.setRequestHeader('x-upload-id', options.uploadId);
+                xhr.setRequestHeader('x-chunk-index', String(options.chunkIndex));
+                xhr.setRequestHeader('x-chunk-sha256', options.chunkSHA256);
+
+                xhr.upload.onprogress = (event) => {
+                    if (!event.lengthComputable) return;
+                    const chunkUploaded = Math.min(
+                        options.chunkBytes,
+                        Math.floor((event.loaded / event.total) * options.chunkBytes)
+                    );
+                    updateFileProgress(options.tile, {
+                        uploadedBytes: options.committedBytes + chunkUploaded,
+                        totalBytes: options.totalBytes,
+                        startedAt: options.startedAt,
+                        status: `正在上传第 ${options.chunkIndex + 1}/${options.totalChunks} 片${options.attempt > 1 ? `（重试 ${options.attempt}/${options.maxAttempts}）` : ''}`
+                    });
+                };
+
+                xhr.onload = () => {
+                    settled = true;
+                    options.controller.signal.removeEventListener('abort', abortHandler);
+                    const data = parseXHRJson(xhr);
+
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        resolve(data);
+                    } else {
+                        const error = new Error(data.error || `HTTP ${xhr.status}`);
+                        error.status = xhr.status;
+                        reject(error);
+                    }
+                };
+
+                xhr.onerror = () => {
+                    settled = true;
+                    options.controller.signal.removeEventListener('abort', abortHandler);
+                    reject(new Error('Network error'));
+                };
+
+                xhr.ontimeout = () => {
+                    settled = true;
+                    options.controller.signal.removeEventListener('abort', abortHandler);
+                    const error = new Error('Upload timed out');
+                    error.status = 408;
+                    reject(error);
+                };
+
+                xhr.onabort = () => {
+                    settled = true;
+                    options.controller.signal.removeEventListener('abort', abortHandler);
+                    reject(createAbortError());
+                };
+
+                xhr.send(options.encryptedBody);
+            });
+        }
+
+        function parseXHRJson(xhr) {
+            try {
+                return xhr.responseText ? JSON.parse(xhr.responseText) : {};
+            } catch (error) {
+                return {};
+            }
+        }
+
+        function shouldRetryError(error) {
+            if (!navigator.onLine) return true;
+            if (!error.status) return true;
+            return error.status === 408 || error.status === 429 || error.status >= 500;
+        }
+
+        function getRetryDelay(attempt) {
+            const jitter = Math.floor(Math.random() * 250);
+            return Math.min(10000, RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1) + jitter);
+        }
+
+        function delayWithSignal(ms, signal) {
+            return new Promise((resolve, reject) => {
+                if (signal.aborted) {
+                    reject(createAbortError());
+                    return;
+                }
+
+                const timeoutId = setTimeout(() => {
+                    signal.removeEventListener('abort', abortHandler);
+                    resolve();
+                }, ms);
+
+                const abortHandler = () => {
+                    clearTimeout(timeoutId);
+                    reject(createAbortError());
+                };
+
+                signal.addEventListener('abort', abortHandler, {once: true});
+            });
+        }
+
+        function waitUntilOnline(signal, tile, progress = {}) {
+            if (navigator.onLine) {
+                return Promise.resolve();
+            }
+
+            if (tile) {
+                updateFileProgress(tile, {
+                    uploadedBytes: progress.uploadedBytes || 0,
+                    totalBytes: progress.totalBytes || 0,
+                    startedAt: progress.startedAt || performance.now(),
+                    status: '网络离线，恢复后会自动继续...'
+                });
+            }
+
+            return new Promise((resolve, reject) => {
+                if (signal.aborted) {
+                    reject(createAbortError());
+                    return;
+                }
+
+                const onlineHandler = () => {
+                    signal.removeEventListener('abort', abortHandler);
+                    resolve();
+                };
+                const abortHandler = () => {
+                    window.removeEventListener('online', onlineHandler);
+                    reject(createAbortError());
+                };
+
+                window.addEventListener('online', onlineHandler, {once: true});
+                signal.addEventListener('abort', abortHandler, {once: true});
+            });
+        }
+
+        function abortChunkUpload(uploadId, token) {
+            fetch(`/e/chunk/${encodeURIComponent(uploadId)}?token=${encodeURIComponent(token)}`, {
+                method: 'DELETE',
+                keepalive: true
+            }).catch(() => {});
+        }
+
+        function updateFileProgress(tile, {uploadedBytes, totalBytes, startedAt, status}) {
+            if (!tile || !document.body.contains(tile)) return;
+
+            const percent = totalBytes > 0 ? Math.min(100, (uploadedBytes / totalBytes) * 100) : 0;
+            const elapsedSeconds = Math.max(0.1, (performance.now() - startedAt) / 1000);
+            const speed = uploadedBytes > 0 ? uploadedBytes / elapsedSeconds : 0;
+            const remainingBytes = Math.max(0, totalBytes - uploadedBytes);
+            const etaSeconds = speed > 0 ? remainingBytes / speed : null;
+
+            const fill = tile.querySelector('.upload-progress-fill');
+            const statusElem = tile.querySelector('.upload-status');
+            const metaElem = tile.querySelector('.upload-meta');
+
+            if (fill) fill.style.width = `${percent.toFixed(1)}%`;
+            if (statusElem) statusElem.textContent = status || '上传中...';
+            if (metaElem) {
+                metaElem.textContent = `${percent.toFixed(1)}% · ${formatBytes(speed)}/s · ETA ${formatDuration(etaSeconds)}`;
+            }
+        }
+
+        function formatBytes(bytes) {
+            if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+            const units = ['B', 'KB', 'MB', 'GB'];
+            let value = bytes;
+            let unitIndex = 0;
+            while (value >= 1024 && unitIndex < units.length - 1) {
+                value /= 1024;
+                unitIndex++;
+            }
+            return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+        }
+
+        function formatDuration(seconds) {
+            if (!Number.isFinite(seconds) || seconds < 0) return '--';
+            if (seconds < 60) return `${Math.ceil(seconds)}s`;
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = Math.ceil(seconds % 60);
+            if (minutes < 60) return `${minutes}m ${remainingSeconds}s`;
+            const hours = Math.floor(minutes / 60);
+            const remainingMinutes = minutes % 60;
+            return `${hours}h ${remainingMinutes}m`;
         }
 
         function createFileTile(file) {
@@ -660,6 +1106,20 @@
             const loader = document.createElement('div');
             loader.className = 'loader';
             overlay.appendChild(loader);
+            const status = document.createElement('div');
+            status.className = 'upload-status';
+            status.textContent = '准备上传...';
+            overlay.appendChild(status);
+            const progressBar = document.createElement('div');
+            progressBar.className = 'upload-progress-bar';
+            const progressFill = document.createElement('div');
+            progressFill.className = 'upload-progress-fill';
+            progressBar.appendChild(progressFill);
+            overlay.appendChild(progressBar);
+            const progressMeta = document.createElement('div');
+            progressMeta.className = 'upload-meta';
+            progressMeta.textContent = '0.0% · 0 B/s · ETA --';
+            overlay.appendChild(progressMeta);
             tile.appendChild(overlay);
 
             // Append the tile to the file list

@@ -18,6 +18,31 @@ node index.js
 
 然后访问 http://localhost:3000/
 
+## Large upload reliability
+
+The browser uploader now sends files through the existing encrypted `/e` upload path in resumable chunks instead of one large request.
+
+What changed:
+
+* Files are sliced into 4MB browser-side chunks.
+* Each chunk is encrypted with the existing pre-shared AES-GCM upload tunnel before it leaves the browser.
+* The server decrypts and stores each chunk in a temporary upload session.
+* Failed chunks are retried automatically with exponential backoff.
+* Uploads pause while the browser is offline and continue when the network returns.
+* The UI shows percentage, current speed, retry/offline state, and ETA.
+* Final storage is unchanged: after all chunks arrive, the server reassembles the original file, calculates the same SHA-256 object key, encrypts it with the existing storage encryption, uploads it to S3, and returns the same `/<sha256>/<filename>` URL format.
+
+Optional environment variables:
+
+```bash
+export MAX_UPLOAD_BYTES=$((500 * 1024 * 1024))       # default: 500MB
+export MAX_UPLOAD_CHUNK_BYTES=$((8 * 1024 * 1024))   # server-side max accepted chunk size
+export UPLOAD_TMP_DIR=/tmp/file-server-chunk-uploads # where temporary chunks are stored
+export CHUNK_UPLOAD_TTL_MS=$((24 * 60 * 60 * 1000))  # temporary upload cleanup age
+```
+
+The legacy `/e` and `/upload` endpoints are still present for compatibility, but the UI uses the chunked encrypted upload flow.
+
 # ES
 
 ```

@@ -1,6 +1,10 @@
 import express from 'express';
 import multer from 'multer';
 import crypto from 'crypto';
+import fs from 'fs/promises';
+import {createReadStream} from 'fs';
+import os from 'os';
+import path from 'path';
 import axios from 'axios';
 import {HttpsProxyAgent} from 'https-proxy-agent';
 import {getFile, uploadFile} from './s3Client.js';
@@ -37,7 +41,7 @@ async function writeLogToElasticsearch(logEntry) {
         return response;
     } catch (error) {
         console.error('Error writing log entry to Elasticsearch:', error);
-        throw error;
+        return null;
     }
 }
 
@@ -48,6 +52,12 @@ const fileCache = new DiskStore({
 });
 
 const hitCounter = new Map();
+
+const MAX_FILE_SIZE = parseInt(process.env.MAX_UPLOAD_BYTES || `${500 * 1024 * 1024}`, 10);
+const MAX_UPLOAD_CHUNK_SIZE = parseInt(process.env.MAX_UPLOAD_CHUNK_BYTES || `${8 * 1024 * 1024}`, 10);
+const MAX_ENCRYPTED_CHUNK_SIZE = MAX_UPLOAD_CHUNK_SIZE + 1024 * 1024;
+const CHUNK_UPLOAD_TTL_MS = parseInt(process.env.CHUNK_UPLOAD_TTL_MS || `${24 * 60 * 60 * 1000}`, 10);
+const chunkUploadRoot = path.resolve(process.env.UPLOAD_TMP_DIR || path.join(os.tmpdir(), 'file-server-chunk-uploads'));
 
 const app = express();
 
@@ -60,7 +70,7 @@ app.use(express.urlencoded({extended: true}));
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
-        fileSize: 500 * 1024 * 1024 // 500MB in bytes
+        fileSize: MAX_FILE_SIZE
     }
 });
 
@@ -89,6 +99,167 @@ function getUserInfo(req) {
         return null;
     }
 }
+
+function validateChunkUploadId(uploadId) {
+    if (typeof uploadId !== 'string' || !/^[0-9a-fA-F-]{36}$/.test(uploadId)) {
+        throw new Error('Invalid upload id');
+    }
+}
+
+function getChunkUploadDir(uploadId) {
+    validateChunkUploadId(uploadId);
+    return path.join(chunkUploadRoot, uploadId);
+}
+
+async function ensureChunkUploadRoot() {
+    await fs.mkdir(chunkUploadRoot, {recursive: true});
+}
+
+async function readChunkUploadMeta(uploadId) {
+    const uploadDir = getChunkUploadDir(uploadId);
+    const metaPath = path.join(uploadDir, 'meta.json');
+    const rawMeta = await fs.readFile(metaPath, 'utf8');
+    return {uploadDir, meta: JSON.parse(rawMeta)};
+}
+
+async function writeChunkUploadMeta(uploadDir, meta) {
+    await fs.writeFile(path.join(uploadDir, 'meta.json'), JSON.stringify(meta, null, 2));
+}
+
+function getChunkPath(uploadDir, chunkIndex) {
+    return path.join(uploadDir, `${chunkIndex}.part`);
+}
+
+function getExpectedChunkSize(meta, chunkIndex) {
+    if (chunkIndex === meta.totalChunks - 1) {
+        return meta.fileSize - (meta.chunkSize * chunkIndex);
+    }
+    return meta.chunkSize;
+}
+
+async function getReceivedChunkIndexes(uploadDir, meta) {
+    const received = [];
+    for (let i = 0; i < meta.totalChunks; i++) {
+        try {
+            const stat = await fs.stat(getChunkPath(uploadDir, i));
+            if (stat.size === getExpectedChunkSize(meta, i)) {
+                received.push(i);
+            }
+        } catch (error) {
+            if (error.code !== 'ENOENT') {
+                throw error;
+            }
+        }
+    }
+    return received;
+}
+
+async function readCompletedChunkUpload(uploadDir) {
+    try {
+        const rawCompleted = await fs.readFile(path.join(uploadDir, 'completed.json'), 'utf8');
+        return JSON.parse(rawCompleted);
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return null;
+        }
+        throw error;
+    }
+}
+
+async function deleteChunkUpload(uploadId) {
+    const uploadDir = getChunkUploadDir(uploadId);
+    await fs.rm(uploadDir, {recursive: true, force: true});
+}
+
+async function removeChunkFiles(uploadDir, meta) {
+    await Promise.all(Array.from({length: meta.totalChunks}, async (_, i) => {
+        await fs.rm(getChunkPath(uploadDir, i), {force: true});
+    }));
+}
+
+async function processAndUploadFileFromChunks(uploadDir, meta, userInfo) {
+    const key = crypto.scryptSync(process.env.ENCRYPTION_PASSWORD, 'salt', 32);
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+    const sha256Hash = crypto.createHash('sha256');
+    const encryptedTempPath = path.join(uploadDir, 'encrypted-upload.tmp');
+    const encryptedHandle = await fs.open(encryptedTempPath, 'w');
+
+    try {
+        await encryptedHandle.write(iv);
+
+        for (let i = 0; i < meta.totalChunks; i++) {
+            const chunkPath = getChunkPath(uploadDir, i);
+            const chunkData = await fs.readFile(chunkPath);
+            const expectedSize = getExpectedChunkSize(meta, i);
+
+            if (chunkData.length !== expectedSize) {
+                throw new Error(`Chunk ${i} has invalid size`);
+            }
+
+            sha256Hash.update(chunkData);
+            const encryptedChunk = cipher.update(chunkData);
+            if (encryptedChunk.length > 0) {
+                await encryptedHandle.write(encryptedChunk);
+            }
+        }
+
+        const encryptedFinal = cipher.final();
+        if (encryptedFinal.length > 0) {
+            await encryptedHandle.write(encryptedFinal);
+        }
+    } finally {
+        await encryptedHandle.close();
+    }
+
+    const sha256 = sha256Hash.digest('hex');
+    const encryptedStat = await fs.stat(encryptedTempPath);
+
+    const newUrl = `/${sha256}/${meta.filename}`;
+
+    try {
+        await uploadFile(`${sha256}`, createReadStream(encryptedTempPath), {
+            contentLength: encryptedStat.size,
+        });
+
+        await writeLogToElasticsearch({
+            timestamp: new Date(),
+            user_id: userInfo.userId,
+            file_name: meta.filename,
+            file_url: newUrl,
+            file_size: meta.fileSize
+        });
+    } finally {
+        await fs.rm(encryptedTempPath, {force: true});
+    }
+
+    return {sha256, newUrl};
+}
+
+async function cleanupStaleChunkUploads() {
+    try {
+        await ensureChunkUploadRoot();
+        const entries = await fs.readdir(chunkUploadRoot, {withFileTypes: true});
+        const now = Date.now();
+
+        await Promise.all(entries.filter(entry => entry.isDirectory()).map(async (entry) => {
+            const uploadDir = path.join(chunkUploadRoot, entry.name);
+            try {
+                const stat = await fs.stat(uploadDir);
+                if (now - stat.mtimeMs > CHUNK_UPLOAD_TTL_MS) {
+                    await fs.rm(uploadDir, {recursive: true, force: true});
+                }
+            } catch (error) {
+                console.warn(`Failed to clean stale upload ${entry.name}:`, error.message);
+            }
+        }));
+    } catch (error) {
+        console.warn('Failed to clean stale chunk uploads:', error.message);
+    }
+}
+
+cleanupStaleChunkUploads();
+setInterval(cleanupStaleChunkUploads, Math.min(CHUNK_UPLOAD_TTL_MS, 60 * 60 * 1000));
 
 app.get('/check-upload-permission', async (req, res) => {
     if (!getUserInfo(req)) {
@@ -132,7 +303,7 @@ app.post('/e', async (req, res) => {
         }
         const encryptedBuffer = Buffer.concat(chunks);
 
-        if (encryptedBuffer.length > 500 * 1024 * 1024) {
+        if (encryptedBuffer.length > MAX_FILE_SIZE + 1024) {
             return res.status(400).json({error: 'File size exceeds the 500MB limit'});
         }
 
@@ -142,6 +313,9 @@ app.post('/e', async (req, res) => {
 
         // Decrypt using pre-shared key
         const decrypted = await decryptBuffer(encrypted, iv);
+        if (decrypted.length > MAX_FILE_SIZE) {
+            return res.status(400).json({error: 'File size exceeds the 500MB limit'});
+        }
 
         const filename = req.headers['x-filename'] || '______';
         const {newUrl} = await processAndUploadFile(decrypted, filename, userInfo);
@@ -150,6 +324,224 @@ app.post('/e', async (req, res) => {
     } catch (error) {
         console.error('Error uploading file:', error);
         res.status(500).json({error: 'Error uploading file'});
+    }
+});
+
+
+app.post('/e/chunk/init', async (req, res) => {
+    const userInfo = getUserInfo(req);
+    if (!userInfo) {
+        res.status(403).send({ok: false});
+        return;
+    }
+
+    try {
+        await ensureChunkUploadRoot();
+
+        const filename = typeof req.body.filename === 'string' && req.body.filename.trim()
+            ? req.body.filename.trim()
+            : '______';
+        const fileSize = Number(req.body.fileSize);
+        const chunkSize = Number(req.body.chunkSize);
+        const totalChunks = Number(req.body.totalChunks);
+
+        if (!Number.isSafeInteger(fileSize) || fileSize <= 0 || fileSize > MAX_FILE_SIZE) {
+            return res.status(400).json({error: 'Invalid file size'});
+        }
+        if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0 || chunkSize > MAX_UPLOAD_CHUNK_SIZE) {
+            return res.status(400).json({error: 'Invalid chunk size'});
+        }
+        if (!Number.isSafeInteger(totalChunks) || totalChunks !== Math.ceil(fileSize / chunkSize)) {
+            return res.status(400).json({error: 'Invalid chunk count'});
+        }
+
+        const uploadId = crypto.randomUUID();
+        const uploadDir = getChunkUploadDir(uploadId);
+        await fs.mkdir(uploadDir, {recursive: true});
+
+        const meta = {
+            uploadId,
+            userId: userInfo.userId,
+            filename,
+            fileSize,
+            chunkSize,
+            totalChunks,
+            createdAt: new Date().toISOString(),
+        };
+
+        await writeChunkUploadMeta(uploadDir, meta);
+
+        res.json({
+            ok: true,
+            uploadId,
+            chunkSize,
+            totalChunks,
+            received: []
+        });
+    } catch (error) {
+        console.error('Error initializing chunk upload:', error);
+        res.status(500).json({error: 'Error initializing upload'});
+    }
+});
+
+app.post('/e/chunk/status', async (req, res) => {
+    const userInfo = getUserInfo(req);
+    if (!userInfo) {
+        res.status(403).send({ok: false});
+        return;
+    }
+
+    try {
+        const {uploadId} = req.body;
+        const {uploadDir, meta} = await readChunkUploadMeta(uploadId);
+
+        if (`${meta.userId}` !== `${userInfo.userId}`) {
+            return res.status(403).send({ok: false});
+        }
+
+        const completed = await readCompletedChunkUpload(uploadDir);
+        if (completed) {
+            return res.json({
+                ok: true,
+                completed: true,
+                url: completed.newUrl,
+                received: Array.from({length: meta.totalChunks}, (_, i) => i),
+                totalChunks: meta.totalChunks
+            });
+        }
+
+        const received = await getReceivedChunkIndexes(uploadDir, meta);
+        res.json({ok: true, completed: false, received, totalChunks: meta.totalChunks});
+    } catch (error) {
+        console.error('Error getting chunk upload status:', error);
+        res.status(404).json({error: 'Upload session not found'});
+    }
+});
+
+app.post('/e/chunk', express.raw({type: 'application/octet-stream', limit: MAX_ENCRYPTED_CHUNK_SIZE}), async (req, res) => {
+    const userInfo = getUserInfo(req);
+    if (!userInfo) {
+        res.status(403).send({ok: false});
+        return;
+    }
+
+    try {
+        const uploadId = req.headers['x-upload-id'];
+        const chunkIndex = Number(req.headers['x-chunk-index']);
+        const chunkSHA256 = req.headers['x-chunk-sha256'];
+
+        if (!Number.isSafeInteger(chunkIndex)) {
+            return res.status(400).json({error: 'Invalid chunk index'});
+        }
+
+        const {uploadDir, meta} = await readChunkUploadMeta(uploadId);
+
+        if (`${meta.userId}` !== `${userInfo.userId}`) {
+            return res.status(403).send({ok: false});
+        }
+        if (chunkIndex < 0 || chunkIndex >= meta.totalChunks) {
+            return res.status(400).json({error: 'Chunk index out of range'});
+        }
+        if (!Buffer.isBuffer(req.body) || req.body.length < 32) {
+            return res.status(400).json({error: 'Invalid chunk body'});
+        }
+
+        const completed = await readCompletedChunkUpload(uploadDir);
+        if (completed) {
+            return res.json({ok: true, completed: true, url: completed.newUrl});
+        }
+
+        const iv = req.body.slice(0, 16);
+        const encrypted = req.body.slice(16);
+        const decrypted = await decryptBuffer(encrypted, iv);
+        const expectedChunkSize = getExpectedChunkSize(meta, chunkIndex);
+
+        if (decrypted.length !== expectedChunkSize) {
+            return res.status(400).json({error: 'Chunk size mismatch'});
+        }
+
+        if (typeof chunkSHA256 === 'string' && chunkSHA256.length > 0) {
+            const actualSHA256 = calculateSHA256(decrypted);
+            if (actualSHA256 !== chunkSHA256) {
+                return res.status(400).json({error: 'Chunk checksum mismatch'});
+            }
+        }
+
+        const chunkPath = getChunkPath(uploadDir, chunkIndex);
+        const tmpPath = `${chunkPath}.${process.pid}.${Date.now()}.tmp`;
+        await fs.writeFile(tmpPath, decrypted);
+        await fs.rename(tmpPath, chunkPath);
+        await fs.utimes(uploadDir, new Date(), new Date());
+
+        res.json({ok: true, chunkIndex});
+    } catch (error) {
+        console.error('Error uploading chunk:', error);
+        res.status(500).json({error: 'Error uploading chunk'});
+    }
+});
+
+app.post('/e/chunk/complete', async (req, res) => {
+    const userInfo = getUserInfo(req);
+    if (!userInfo) {
+        res.status(403).send({ok: false});
+        return;
+    }
+
+    try {
+        const {uploadId} = req.body;
+        const {uploadDir, meta} = await readChunkUploadMeta(uploadId);
+
+        if (`${meta.userId}` !== `${userInfo.userId}`) {
+            return res.status(403).send({ok: false});
+        }
+
+        const completed = await readCompletedChunkUpload(uploadDir);
+        if (completed) {
+            return res.json({url: completed.newUrl, sha256: completed.sha256, completed: true});
+        }
+
+        const received = await getReceivedChunkIndexes(uploadDir, meta);
+        if (received.length !== meta.totalChunks) {
+            const receivedSet = new Set(received);
+            const missing = Array.from({length: meta.totalChunks}, (_, i) => i).filter(i => !receivedSet.has(i));
+            return res.status(409).json({error: 'Missing chunks', missing, received});
+        }
+
+        const {sha256, newUrl} = await processAndUploadFileFromChunks(uploadDir, meta, userInfo);
+
+        await fs.writeFile(path.join(uploadDir, 'completed.json'), JSON.stringify({
+            sha256,
+            newUrl,
+            completedAt: new Date().toISOString(),
+        }, null, 2));
+        await removeChunkFiles(uploadDir, meta);
+        await fs.utimes(uploadDir, new Date(), new Date());
+
+        res.json({url: newUrl, sha256});
+    } catch (error) {
+        console.error('Error completing chunk upload:', error);
+        res.status(500).json({error: 'Error completing upload'});
+    }
+});
+
+app.delete('/e/chunk/:uploadId', async (req, res) => {
+    const userInfo = getUserInfo(req);
+    if (!userInfo) {
+        res.status(403).send({ok: false});
+        return;
+    }
+
+    try {
+        const {uploadId} = req.params;
+        const {meta} = await readChunkUploadMeta(uploadId);
+        if (`${meta.userId}` !== `${userInfo.userId}`) {
+            return res.status(403).send({ok: false});
+        }
+
+        await deleteChunkUpload(uploadId);
+        res.json({ok: true});
+    } catch (error) {
+        res.json({ok: true});
     }
 });
 
@@ -201,7 +593,7 @@ app.get('/:sha256/:filename', async (req, res) => {
         let fileData = decrypt(encryptedData);
         hitCounter.set(key, (hitCounter.get(key) || 0) + 1);
 
-        if (hitCounter.get(key) >= 8 && fileData.length <= 500 * 1024 * 1024) {
+        if (hitCounter.get(key) >= 8 && fileData.length <= MAX_FILE_SIZE) {
             await fileCache.set(key, fileData);
         }
 
