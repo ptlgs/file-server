@@ -41,7 +41,6 @@ export MAX_UPLOAD_CHUNK_BYTES=$((8 * 1024 * 1024))   # server-side max accepted 
 export UPLOAD_TMP_DIR=/tmp/file-server-chunk-uploads # where temporary chunks are stored
 export CHUNK_UPLOAD_TTL_MS=$((24 * 60 * 60 * 1000))  # temporary upload cleanup age
 export CACHE_DIR=diskcache                            # mount a K8S PVC here for persistent cache
-export CACHE_TTL_MS=$((3 * 24 * 60 * 60 * 1000))      # cached download lifetime
 export CACHE_MAX_USAGE_RATIO=0.9                      # default cache cap when CACHE_MAX_BYTES is unset
 export CACHE_MAX_BYTES=10Gi                           # optional explicit cache cap
 export CACHE_MIN_FREE_BYTES=1Gi                       # optional filesystem free-space reserve

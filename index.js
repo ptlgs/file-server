@@ -45,7 +45,6 @@ async function writeLogToElasticsearch(logEntry) {
 }
 
 const CACHE_DIR = path.resolve(process.env.CACHE_DIR || 'diskcache');
-const FILE_CACHE_TTL_MS = parseIntegerEnv('CACHE_TTL_MS', 86400 * 3 * 1000);
 const CACHE_MAX_USAGE_RATIO = parseRatioEnv('CACHE_MAX_USAGE_RATIO', 0.9);
 const CONFIGURED_CACHE_MAX_BYTES = parseByteSizeEnv('CACHE_MAX_BYTES');
 const CONFIGURED_CACHE_MIN_FREE_BYTES = parseByteSizeEnv('CACHE_MIN_FREE_BYTES');
@@ -86,21 +85,6 @@ app.use(express.static('public'));
 
 function calculateSHA256(buffer) {
     return crypto.createHash('sha256').update(buffer).digest('hex');
-}
-
-function parseIntegerEnv(name, fallback) {
-    const value = process.env[name];
-    if (!value) {
-        return fallback;
-    }
-
-    const parsed = Number.parseInt(value, 10);
-    if (Number.isSafeInteger(parsed) && parsed > 0) {
-        return parsed;
-    }
-
-    console.warn(`Invalid ${name} value "${value}", using ${fallback}`);
-    return fallback;
 }
 
 function parseRatioEnv(name, fallback) {
@@ -311,7 +295,6 @@ async function collectCacheEntries() {
             size: 0,
             lastAccessedMs: 0,
             key: null,
-            expireTime: null,
         };
 
         entry.files.push(filePath);
@@ -322,7 +305,6 @@ async function collectCacheEntries() {
             try {
                 const data = JSON.parse(await fs.readFile(filePath, 'utf8'));
                 entry.key = data.key;
-                entry.expireTime = data.expireTime;
             } catch (error) {
                 console.warn(`Failed to read cache metadata ${filePath}:`, error.message);
             }
@@ -337,15 +319,6 @@ async function collectCacheEntries() {
 async function deleteCacheEntry(entry) {
     await Promise.all(entry.files.map(filePath => fs.rm(filePath, {force: true})));
     await fs.rmdir(path.dirname(entry.basePath)).catch(() => 0);
-}
-
-async function deleteCacheEntryByKey(key) {
-    const basePath = getCacheEntryBaseByKey(key);
-    await Promise.all([
-        fs.rm(getCacheDataPath(basePath), {force: true}),
-        fs.rm(getCacheMetadataPath(basePath), {force: true}),
-    ]);
-    await fs.rmdir(path.dirname(basePath)).catch(() => 0);
 }
 
 async function evictCacheEntries(entries, bytesToFree, reason) {
@@ -382,14 +355,6 @@ async function enforceCacheLimits(requiredBytes = 0, reason = 'cache limit') {
     let entries = await collectCacheEntries();
     let usageBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
     let freedBytes = 0;
-
-    const now = Date.now();
-    const expiredEntries = entries.filter(entry => entry.expireTime && entry.expireTime <= now);
-    if (expiredEntries.length > 0) {
-        freedBytes += await evictCacheEntries(expiredEntries, Infinity, 'expired cache entries');
-        entries = entries.filter(entry => !(entry.expireTime && entry.expireTime <= now));
-        usageBytes = Math.max(0, usageBytes - freedBytes);
-    }
 
     const expectedAvailableBytes = stats.availableBytes + freedBytes;
     const maxSizeShortfall = Math.max(0, usageBytes + requiredBytes - cacheMaxBytes);
@@ -448,11 +413,6 @@ async function getCachedFileData(key) {
             return undefined;
         }
 
-        if (metadata.expireTime && metadata.expireTime <= Date.now()) {
-            await deleteCacheEntryByKey(key);
-            return undefined;
-        }
-
         const cachedData = await fs.readFile(getCacheDataPath(basePath));
         await touchCacheEntry(key);
         return cachedData;
@@ -474,7 +434,6 @@ async function writeCacheEntry(key, fileData) {
     const tempMetadataPath = `${getCacheMetadataPath(basePath)}.${tempSuffix}`;
     const metadata = {
         key,
-        expireTime: Date.now() + FILE_CACHE_TTL_MS,
         size: fileData.length,
     };
 
