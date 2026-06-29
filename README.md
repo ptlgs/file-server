@@ -38,7 +38,8 @@ What changed:
 * Failed chunks are retried automatically with exponential backoff.
 * Uploads pause while the browser is offline and continue when the network returns.
 * The UI shows percentage, current speed, retry/offline state, and ETA.
-* Final storage is unchanged: after all chunks arrive, the server reassembles the original file, calculates the same SHA-256 object key, encrypts it with the existing storage encryption, uploads it to S3, and returns the same `/<sha256>/<filename>` URL format.
+* Final storage still uses the existing encryption flow: after all chunks arrive, the server reassembles the original file, calculates the SHA-256 digest, encrypts it, uploads it to S3 using a deterministic 12-character Base58 key derived from that digest, and returns the `/<12-char-base58-key>/<filename>` URL format.
+* Existing long SHA-256 URLs continue to work as long as their original S3 objects remain present.
 
 Optional environment variables:
 

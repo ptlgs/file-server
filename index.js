@@ -59,6 +59,9 @@ const MAX_UPLOAD_CHUNK_SIZE = parseInt(process.env.MAX_UPLOAD_CHUNK_BYTES || `${
 const MAX_ENCRYPTED_CHUNK_SIZE = MAX_UPLOAD_CHUNK_SIZE + 1024 * 1024;
 const CHUNK_UPLOAD_TTL_MS = parseInt(process.env.CHUNK_UPLOAD_TTL_MS || `${24 * 60 * 60 * 1000}`, 10);
 const chunkUploadRoot = path.resolve(process.env.UPLOAD_TMP_DIR || path.join(os.tmpdir(), 'file-server-chunk-uploads'));
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const BASE58_FILE_KEY_LENGTH = 12;
+const BASE58_FILE_KEY_SPACE = BigInt(BASE58_ALPHABET.length) ** BigInt(BASE58_FILE_KEY_LENGTH);
 
 const app = express();
 
@@ -85,6 +88,29 @@ app.use(express.static('public'));
 
 function calculateSHA256(buffer) {
     return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+function getFileKey(sha256) {
+    let value = BigInt(`0x${sha256}`) % BASE58_FILE_KEY_SPACE;
+    let fileKey = '';
+
+    for (let i = 0; i < BASE58_FILE_KEY_LENGTH; i++) {
+        const index = Number(value % BigInt(BASE58_ALPHABET.length));
+        fileKey = BASE58_ALPHABET[index] + fileKey;
+        value = value / BigInt(BASE58_ALPHABET.length);
+    }
+
+    return fileKey;
+}
+
+function getCompletedFileKey(completed) {
+    if (completed.fileKey) {
+        return completed.fileKey;
+    }
+    if (completed.newUrl) {
+        return completed.newUrl.split('/').filter(Boolean)[0];
+    }
+    return undefined;
 }
 
 function parseRatioEnv(name, fallback) {
@@ -621,10 +647,11 @@ async function processAndUploadFileFromChunks(uploadDir, meta, userInfo) {
     const sha256 = sha256Hash.digest('hex');
     const encryptedStat = await fs.stat(encryptedTempPath);
 
-    const newUrl = `/${sha256}/${meta.filename}`;
+    const fileKey = getFileKey(sha256);
+    const newUrl = `/${fileKey}/${meta.filename}`;
 
     try {
-        await uploadFile(`${sha256}`, createReadStream(encryptedTempPath), {
+        await uploadFile(fileKey, createReadStream(encryptedTempPath), {
             contentLength: encryptedStat.size,
         });
 
@@ -639,7 +666,7 @@ async function processAndUploadFileFromChunks(uploadDir, meta, userInfo) {
         await fs.rm(encryptedTempPath, {force: true});
     }
 
-    return {sha256, newUrl};
+    return {sha256, fileKey, newUrl};
 }
 
 async function cleanupStaleChunkUploads() {
@@ -678,11 +705,12 @@ app.get('/check-upload-permission', async (req, res) => {
 
 async function processAndUploadFile(buffer, originalFilename, userInfo) {
     const sha256 = calculateSHA256(buffer);
+    const fileKey = getFileKey(sha256);
     const encryptedData = encrypt(buffer);
 
-    await uploadFile(`${sha256}`, encryptedData);
+    await uploadFile(fileKey, encryptedData);
 
-    const newUrl = `/${sha256}/${originalFilename}`;
+    const newUrl = `/${fileKey}/${originalFilename}`;
 
     await writeLogToElasticsearch({
         timestamp: new Date(),
@@ -692,7 +720,7 @@ async function processAndUploadFile(buffer, originalFilename, userInfo) {
         file_size: buffer.length
     });
 
-    return {sha256, newUrl};
+    return {sha256, fileKey, newUrl};
 }
 
 app.post('/e', async (req, res) => {
@@ -807,10 +835,12 @@ app.post('/e/chunk/status', async (req, res) => {
 
         const completed = await readCompletedChunkUpload(uploadDir);
         if (completed) {
+            const fileKey = getCompletedFileKey(completed);
             return res.json({
                 ok: true,
                 completed: true,
                 url: completed.newUrl,
+                fileKey,
                 received: Array.from({length: meta.totalChunks}, (_, i) => i),
                 totalChunks: meta.totalChunks
             });
@@ -854,7 +884,8 @@ app.post('/e/chunk', express.raw({type: 'application/octet-stream', limit: MAX_E
 
         const completed = await readCompletedChunkUpload(uploadDir);
         if (completed) {
-            return res.json({ok: true, completed: true, url: completed.newUrl});
+            const fileKey = getCompletedFileKey(completed);
+            return res.json({ok: true, completed: true, url: completed.newUrl, fileKey});
         }
 
         const iv = req.body.slice(0, 16);
@@ -903,7 +934,13 @@ app.post('/e/chunk/complete', async (req, res) => {
 
         const completed = await readCompletedChunkUpload(uploadDir);
         if (completed) {
-            return res.json({url: completed.newUrl, sha256: completed.sha256, completed: true});
+            const fileKey = getCompletedFileKey(completed);
+            return res.json({
+                url: completed.newUrl,
+                sha256: completed.sha256,
+                fileKey,
+                completed: true
+            });
         }
 
         const received = await getReceivedChunkIndexes(uploadDir, meta);
@@ -913,17 +950,18 @@ app.post('/e/chunk/complete', async (req, res) => {
             return res.status(409).json({error: 'Missing chunks', missing, received});
         }
 
-        const {sha256, newUrl} = await processAndUploadFileFromChunks(uploadDir, meta, userInfo);
+        const {sha256, fileKey, newUrl} = await processAndUploadFileFromChunks(uploadDir, meta, userInfo);
 
         await fs.writeFile(path.join(uploadDir, 'completed.json'), JSON.stringify({
             sha256,
+            fileKey,
             newUrl,
             completedAt: new Date().toISOString(),
         }, null, 2));
         await removeChunkFiles(uploadDir, meta);
         await fs.utimes(uploadDir, new Date(), new Date());
 
-        res.json({url: newUrl, sha256});
+        res.json({url: newUrl, sha256, fileKey});
     } catch (error) {
         console.error('Error completing chunk upload:', error);
         res.status(500).json({error: 'Error completing upload'});
@@ -977,15 +1015,15 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-app.get('/:sha256/:filename', async (req, res) => {
+app.get('/:fileKey/:filename', async (req, res) => {
     try {
-        const {sha256, filename} = req.params;
-        const key = `${sha256}`;
+        const {fileKey, filename} = req.params;
+        const key = fileKey;
 
         // Set aggressive caching headers
         res.set({
             'Cache-Control': 'public, max-age=31536000, immutable',
-            'ETag': `"${sha256}"`,
+            'ETag': `"${fileKey}"`,
         });
 
         // Check if the file is in cache
