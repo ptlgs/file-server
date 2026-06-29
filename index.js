@@ -59,9 +59,10 @@ const MAX_UPLOAD_CHUNK_SIZE = parseInt(process.env.MAX_UPLOAD_CHUNK_BYTES || `${
 const MAX_ENCRYPTED_CHUNK_SIZE = MAX_UPLOAD_CHUNK_SIZE + 1024 * 1024;
 const CHUNK_UPLOAD_TTL_MS = parseInt(process.env.CHUNK_UPLOAD_TTL_MS || `${24 * 60 * 60 * 1000}`, 10);
 const chunkUploadRoot = path.resolve(process.env.UPLOAD_TMP_DIR || path.join(os.tmpdir(), 'file-server-chunk-uploads'));
-const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-const BASE58_FILE_KEY_LENGTH = 12;
-const BASE58_FILE_KEY_SPACE = BigInt(BASE58_ALPHABET.length) ** BigInt(BASE58_FILE_KEY_LENGTH);
+const CROCKFORD_BASE32_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+const CROCKFORD_FILE_KEY_LENGTH = 14;
+const CROCKFORD_FILE_KEY_SPACE = BigInt(CROCKFORD_BASE32_ALPHABET.length) ** BigInt(CROCKFORD_FILE_KEY_LENGTH);
+const CROCKFORD_FILE_KEY_PATTERN = /^[0-9A-HJKMNP-TV-Z]{14}$/;
 
 const app = express();
 
@@ -91,16 +92,28 @@ function calculateSHA256(buffer) {
 }
 
 function getFileKey(sha256) {
-    let value = BigInt(`0x${sha256}`) % BASE58_FILE_KEY_SPACE;
+    let value = BigInt(`0x${sha256}`) % CROCKFORD_FILE_KEY_SPACE;
     let fileKey = '';
 
-    for (let i = 0; i < BASE58_FILE_KEY_LENGTH; i++) {
-        const index = Number(value % BigInt(BASE58_ALPHABET.length));
-        fileKey = BASE58_ALPHABET[index] + fileKey;
-        value = value / BigInt(BASE58_ALPHABET.length);
+    for (let i = 0; i < CROCKFORD_FILE_KEY_LENGTH; i++) {
+        const index = Number(value % BigInt(CROCKFORD_BASE32_ALPHABET.length));
+        fileKey = CROCKFORD_BASE32_ALPHABET[index] + fileKey;
+        value = value / BigInt(CROCKFORD_BASE32_ALPHABET.length);
     }
 
     return fileKey;
+}
+
+function normalizeFileKey(fileKey) {
+    if (fileKey.length !== CROCKFORD_FILE_KEY_LENGTH) {
+        return fileKey;
+    }
+
+    const normalized = fileKey.toUpperCase()
+        .replace(/O/g, '0')
+        .replace(/[IL]/g, '1');
+
+    return CROCKFORD_FILE_KEY_PATTERN.test(normalized) ? normalized : fileKey;
 }
 
 function getCompletedFileKey(completed) {
@@ -1018,12 +1031,12 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 app.get('/:fileKey/:filename', async (req, res) => {
     try {
         const {fileKey, filename} = req.params;
-        const key = fileKey;
+        const key = normalizeFileKey(fileKey);
 
         // Set aggressive caching headers
         res.set({
             'Cache-Control': 'public, max-age=31536000, immutable',
-            'ETag': `"${fileKey}"`,
+            'ETag': `"${key}"`,
         });
 
         // Check if the file is in cache
