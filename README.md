@@ -7,6 +7,9 @@
 ```
 npm i
 export ENCRYPTION_PASSWORD=...
+export JWT_SECRET=...
+export FRONTEND_PASSWORD=... # existing single login password
+# or: export FRONTEND_PASSWORDS='password-a,password-b'
 export PROXY=https://... # optional, used for outbound HTTP and S3 if S3_PROXY is unset
 export S3_PROXY=https://... # optional, overrides PROXY for S3 uploads/downloads
 export S3_ACCESS_KEY=...
@@ -18,6 +21,10 @@ node index.js
 ```
 
 然后访问 http://localhost:3000/
+
+`FRONTEND_PASSWORD`/`FRONTEND_PASSWORDS` is checked by `frontendServer.js` when logging in. The upload backend does not check this password directly; it verifies the JWT upload token signed with `JWT_SECRET`.
+
+To allow multiple login passwords, set `FRONTEND_PASSWORDS` to a comma-separated list or JSON array. All configured passwords have the same access. To revoke one, remove it from `FRONTEND_PASSWORDS` and restart the frontend server.
 
 ## Large upload reliability
 

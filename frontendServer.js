@@ -26,12 +26,61 @@ function generateSessionId() {
 // Store active sessions (in production, use Redis or a database)
 const activeSessions = new Map();
 
-// Secure password comparison (constant-time)
+function parsePasswordList(value) {
+  if (!value) {
+    return [];
+  }
+
+  const trimmedValue = value.trim();
+  if (!trimmedValue) {
+    return [];
+  }
+
+  if (trimmedValue.startsWith("[")) {
+    try {
+      const parsedValue = JSON.parse(trimmedValue);
+      if (Array.isArray(parsedValue)) {
+        return parsedValue.map(String).filter(Boolean);
+      }
+      console.error("FRONTEND_PASSWORDS must be a comma-separated list or JSON array.");
+      return [];
+    } catch (error) {
+      console.error("FRONTEND_PASSWORDS must be a comma-separated list or JSON array.");
+      return [];
+    }
+  }
+
+  return value.split(",").map(password => password.trim()).filter(Boolean);
+}
+
+function getFrontendPasswords() {
+  return [
+    ...parsePasswordList(process.env.FRONTEND_PASSWORDS),
+    ...(process.env.FRONTEND_PASSWORD ? [process.env.FRONTEND_PASSWORD] : [])
+  ];
+}
+
+// Secure password comparison (constant-time for equal-length inputs)
 function secureCompare(a, b) {
-    if (a.length != b.length) {
+    if (typeof a !== "string" || typeof b !== "string") {
         return false;
     }
-    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+
+    const aBuffer = Buffer.from(a);
+    const bBuffer = Buffer.from(b);
+    if (aBuffer.length !== bBuffer.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(aBuffer, bBuffer);
+}
+
+function isValidFrontendPassword(password, configuredPasswords) {
+  let isValid = false;
+  for (const configuredPassword of configuredPasswords) {
+    isValid = secureCompare(password, configuredPassword) || isValid;
+  }
+  return isValid;
 }
 
 app.get("/api/main-server-url", (req, res) => {
@@ -44,15 +93,15 @@ app.get("/login", (req, res) => {
 
 app.post("/login", (req, res) => {
   const { password } = req.body;
-  const FRONTEND_PASSWORD = process.env.FRONTEND_PASSWORD;
+  const frontendPasswords = getFrontendPasswords();
 
-  if (!FRONTEND_PASSWORD) {
-    console.error("FRONTEND_PASSWORD is not set in environment variables.");
+  if (frontendPasswords.length === 0) {
+    console.error("FRONTEND_PASSWORD or FRONTEND_PASSWORDS is not set in environment variables.");
     return res.status(500).send("Server configuration error.");
   }
 
   try {
-    if (secureCompare(password, FRONTEND_PASSWORD)) {
+    if (isValidFrontendPassword(password, frontendPasswords)) {
       // Generate a secure session ID
       const sessionId = generateSessionId();
 
