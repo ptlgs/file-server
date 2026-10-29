@@ -193,6 +193,38 @@ if (domainsToAutoUploadImagesExcept.length === 0 && domainsToAutoUploadImages.le
     autoUploadEnabled = false;
 }
 
+// Optional extra headers for image fetching, set via AUTO_UPLOAD_EXTRA_HEADERS
+// as a JSON object mapping a host (suffix-matched, or "*" for all hosts) to
+// the headers to send for it, e.g.:
+//   {"doubanio.com": {"Referer": "https://movie.douban.com/"}}
+let extraImageFetchHeaders = {};
+if (process.env.AUTO_UPLOAD_EXTRA_HEADERS) {
+    try {
+        extraImageFetchHeaders = JSON.parse(process.env.AUTO_UPLOAD_EXTRA_HEADERS);
+    } catch (e) {
+        console.error('AUTO_UPLOAD_EXTRA_HEADERS is not valid JSON; ignoring it.');
+    }
+}
+
+function buildImageFetchHeaders(url) {
+    const headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    };
+    let hostname = '';
+    try {
+        hostname = new URL(url).hostname;
+    } catch (e) {
+        // Malformed URL; let axios surface the error.
+    }
+    for (const [host, hostHeaders] of Object.entries(extraImageFetchHeaders)) {
+        if (!hostHeaders || typeof hostHeaders !== 'object') continue;
+        if (host === '*' || hostname === host || hostname.endsWith('.' + host)) {
+            Object.assign(headers, hostHeaders);
+        }
+    }
+    return headers;
+}
+
 app.post('/auto-upload-images', async (req, res) => {
     if (!autoUploadEnabled) {
         return res.status(503).json({
@@ -261,9 +293,7 @@ app.post('/auto-upload-images', async (req, res) => {
                     try {
                         const response = await axios.get(url, {
                             responseType: 'arraybuffer',
-                            headers: {
-                                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-                            }
+                            headers: buildImageFetchHeaders(url)
                         });
                         const buffer = Buffer.from(response.data);
 
